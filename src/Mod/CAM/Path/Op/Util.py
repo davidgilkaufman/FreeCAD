@@ -433,7 +433,7 @@ def getClearedAreas(currentOp, bbox):
     """
     clearedAreas = []
     job = currentOp.Proxy.job
-    z = bbox.ZMin + currentOp.job.GeometryTolerance.getValueAs("mm")
+    z = bbox.ZMin + job.GeometryTolerance.getValueAs("mm")
     for op in job.Operations.Group:
         baseOp = PathDressup.baseOp(op)
         if baseOp.Name == currentOp.Name:
