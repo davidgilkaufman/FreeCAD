@@ -438,7 +438,7 @@ def getClearedAreas(currentOp, bbox):
         baseOp = PathDressup.baseOp(op)
         if baseOp.Name == currentOp.Name:
             break
-        if getattr(op, "Active", False) and op.Path:
+        if getattr(baseOp, "Active", None) and op.Path:
             tool = baseOp.ToolController.Tool
             diameter = tool.Diameter.getValueAs("mm")
             # for drills, dz translates to the full width part of the tool
