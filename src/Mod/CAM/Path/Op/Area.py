@@ -291,7 +291,7 @@ class ObjectOp(PathOp.ObjectOp):
             restSections = []
             for section in sections:
                 bbox = section.getShape().BoundBox
-                sectionClearedAreas = PathOpUtil.getClearedAreas(self, bbox)
+                sectionClearedAreas = PathOpUtil.getClearedAreas(obj, bbox)
                 restSection = section.getRestArea(
                     sectionClearedAreas, self.tool.Diameter.getValueAs("mm")
                 )
