@@ -24,7 +24,6 @@
 
 #include "Adaptive.hpp"
 #include <iostream>
-#include <fstream>
 #include <cmath>
 #include <cstring>
 #include <ctime>
