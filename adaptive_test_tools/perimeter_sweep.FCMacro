@@ -1,0 +1,164 @@
+# Copy of adaptive_fix_overcut_bug/adaptive_perimeter_sweep.FCMacro (case building unchanged) that
+# computes selected ops with cut load dumps; run_sweep.sh renders the dumps to out/<SWEEP_NAME>/
+# (SWEEP_NAME default: sweep).
+#
+#   SWEEP_COMPUTE=0,3,7 (default 0; "all" for every op): ops to compute, one at a time. Op i dumps to
+#   data/<SWEEP_NAME>/P<i>.<n>.bin (n counts Execute calls in the process; see CutLoadDumper). The document
+#   is saved to data/<SWEEP_NAME>/perimeter_sweep.FCStd with the computed ops active.
+#
+# Perimeter sweep for adaptive profiling: rectangular pockets profiled on the inside by an adaptive
+# op, one job per pocket. The pocket perimeter grows by 10% of the stepover per case, so the 10 cases
+# cover one full stepover of "how the passes line up when a loop closes".
+#
+# Every op is disabled as soon as it is created (to prevent accidental recomputes); only the first is
+# re-enabled at the end. Toggle Active on the others to compute them.
+
+import FreeCAD as App
+import Part
+import Path.Main.Job as PathJob
+import Path.Main.Stock as PathStock
+import Path.Op.Adaptive as PathAdaptive
+
+if App.GuiUp:
+    import FreeCADGui as Gui
+    import Path.Main.Gui.Job as JobGui
+    import Path.Op.Gui.Adaptive as AdaptiveGui
+    import Path.Op.Gui.Base as PathOpGui
+
+TOOL_DIAMETER = 6.0
+STEP_OVER_PERCENT = 20.0
+HELIX_MAX_DIAMETER_PERCENT = 100  # the op's default; enters the profiling band width below
+POCKET_DEPTH = 3.0
+PLATE_THICKNESS = 6.0
+WALL = TOOL_DIAMETER  # plate material around the pocket
+GAP = 10.0  # between neighbouring stocks
+CASE_COUNT = 10
+
+TOOL_RADIUS = TOOL_DIAMETER / 2
+STEP_OVER = STEP_OVER_PERCENT / 100 * TOOL_DIAMETER
+PERIMETER_INCREMENT = 0.1 * STEP_OVER
+
+# Width of the band adaptive profiling clears along each wall (see Adaptive2d::Execute, profiling:
+# offset = 2 * (toolRadius + helixRampMaxRadius + finishPassOffset) + MIN_STEP_CLIPPER; the last
+# term is tiny and ignored here).
+FINISH_PASS_OFFSET = STEP_OVER / 10  # FINISHING_THICKNESS_SCALE
+HELIX_RADIUS = HELIX_MAX_DIAMETER_PERCENT / 100 * TOOL_DIAMETER / 2
+BAND = 2 * (TOOL_RADIUS + HELIX_RADIUS + FINISH_PASS_OFFSET)
+
+# Fixed pocket height: the top and bottom bands are a tool radius apart
+POCKET_HEIGHT = 2 * BAND + 3 * TOOL_RADIUS
+# Base perimeter: a square pocket
+BASE_PERIMETER = 4 * POCKET_HEIGHT
+
+
+def make_case(doc, index, perimeter, origin):
+    """Plate with a rectangular pocket of the given perimeter (fixed height, width from perimeter),
+    in its own job with stock = the plate, and a disabled adaptive inside profile on the pocket.
+    origin: plate's lower left corner. Returns the op."""
+    width = perimeter / 2 - POCKET_HEIGHT
+    name = f"P{index}"
+
+    plate_x = width + 2 * WALL
+    plate_y = POCKET_HEIGHT + 2 * WALL
+    plate = Part.makeBox(plate_x, plate_y, PLATE_THICKNESS, App.Vector(0, 0, -PLATE_THICKNESS))
+    pocket = Part.makeBox(width, POCKET_HEIGHT, POCKET_DEPTH, App.Vector(WALL, WALL, -POCKET_DEPTH))
+    shape = plate.cut(pocket).removeSplitter().translated(origin)
+
+    part = doc.addObject("Part::Feature", f"Plate_{name}")
+    part.Label = f"Plate {name} (perimeter {perimeter:.3f} mm, width {width:.3f} mm)"
+    part.Shape = shape
+
+    job = PathJob.Create(f"Job_{name}", [part])
+    job.Label = f"Job {name}"
+    if App.GuiUp:
+        # what the Job command does (Path.Main.Gui.Job.Create), minus the task panel
+        job.ViewObject.Proxy = JobGui.ViewProvider(job.ViewObject)
+        job.ViewObject.addExtension("Gui::ViewProviderGroupExtensionPython")
+        job.ViewObject.Proxy.deleteOnReject = False  # else Cancel in the first job edit deletes it
+    model = job.Model.Group[0]
+
+    oldStock = job.Stock
+    job.Stock = PathStock.CreateFromBase(job, neg=App.Vector(0, 0, 0), pos=App.Vector(0, 0, 0))
+    doc.removeObject(oldStock.Name)
+
+    tc = job.Tools.Group[0]
+    tc.Tool.Diameter = TOOL_DIAMETER
+    tc.SpindleSpeed = 10000
+    tc.HorizFeed = "10 mm/s"
+    tc.VertFeed = "5 mm/s"
+
+    # pocket floor: the horizontal face at z = -POCKET_DEPTH
+    floor = None
+    for i, f in enumerate(model.Shape.Faces):
+        bb = f.BoundBox
+        if bb.ZLength < 1e-6 and abs(bb.ZMax + POCKET_DEPTH) < 1e-6:
+            floor = f"Face{i + 1}"
+    assert floor, f"{name}: pocket floor not found"
+
+    op = PathAdaptive.Create(f"Adaptive_{name}", parentJob=job)
+    op.Active = False  # first thing: no accidental recomputes
+    if App.GuiUp:
+        # what the Adaptive command does (Path.Op.Gui.Base.Create), minus the task panel; without
+        # this, double clicking the op opens the generic Transform panel
+        op.ViewObject.Proxy = PathOpGui.ViewProvider(op.ViewObject, AdaptiveGui.Command.res)
+        # not a fresh GUI creation: otherwise the first edit replaces Base with the selection and
+        # Cancel deletes the op
+        op.ViewObject.Proxy.deleteOnReject = False
+    op.Label = f"AdaptiveProfile {name}"
+    op.ToolController = tc
+    op.Base = [(model, (floor,))]
+    op.OperationType = "Profiling"
+    op.Side = "Inside"
+    op.StepOverPercent = STEP_OVER_PERCENT
+    op.HelixMaxDiameterPercent = HELIX_MAX_DIAMETER_PERCENT
+    op.setExpression("StepDown", None)
+    op.StepDown = f"{POCKET_DEPTH} mm"  # one layer
+    op.setExpression("FinalDepth", None)
+    op.FinalDepth = -POCKET_DEPTH
+
+    if App.GuiUp:
+        part.ViewObject.Visibility = False
+        model.ViewObject.Visibility = False
+        job.Stock.ViewObject.Visibility = True
+
+    print(f"{name}: perimeter {perimeter:.3f} mm, pocket {width:.3f} x {POCKET_HEIGHT:.3f} mm")
+    return op
+
+
+doc = App.newDocument("adaptive_perimeter_sweep")
+print(
+    f"tool {TOOL_DIAMETER} mm, stepover {STEP_OVER:.3f} mm ({STEP_OVER_PERCENT}%), "
+    f"perimeter increment {PERIMETER_INCREMENT:.4f} mm, band {BAND:.3f} mm"
+)
+
+ops = []
+y = 0.0
+for i in range(CASE_COUNT):
+    ops.append(make_case(doc, i, BASE_PERIMETER + i * PERIMETER_INCREMENT, App.Vector(0, y, 0)))
+    y += POCKET_HEIGHT + 2 * WALL + GAP
+doc.recompute()  # all ops inactive: builds stock etc. only
+
+if App.GuiUp:
+    Gui.ActiveDocument.ActiveView.fitAll()
+
+import os
+import time
+
+# this macro's directory: __file__ is set by FreeCAD when run as a macro, and by run_sweep.sh
+HERE = os.path.dirname(os.path.abspath(__file__))
+SWEEP_NAME = os.environ.get("SWEEP_NAME", "sweep")  # output subdirectory name
+DATA = os.path.join(HERE, "data", SWEEP_NAME)
+os.makedirs(DATA, exist_ok=True)
+
+which = os.environ.get("SWEEP_COMPUTE", "0")
+indices = range(CASE_COUNT) if which == "all" else [int(s) for s in which.split(",")]
+for i in indices:
+    op = ops[i]
+    os.environ["ADAPTIVE_DUMP"] = os.path.join(DATA, f"P{i}")  # read by each Execute()
+    op.Active = True
+    start = time.time()
+    op.recompute()
+    print(f"P{i}: op state {op.State}, {len(op.Path.Commands)} commands, {time.time() - start:.1f} s")
+os.environ.pop("ADAPTIVE_DUMP", None)
+
+doc.saveAs(os.path.join(DATA, "perimeter_sweep.FCStd"))
