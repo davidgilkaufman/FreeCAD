@@ -4383,11 +4383,11 @@ void Adaptive2d::ProcessPolyNode(
             errorFraction = abs(error / optimalCutAreaPD);
             interp.addPoint(error, {angle, newToolPos}, pointNotInterp, isConventional);
             if (cutLoadDumper.enabled && !out.tries.empty()) {
-                if (interp.m_best) {
-                    out.tries.back().minAngle = interp.m_best->angle.first;
+                if (interp.m_min) {
+                    out.tries.back().minAngle = interp.m_min->angle.first;
                 }
-                if (interp.m_bound) {
-                    out.tries.back().maxAngle = interp.m_bound->angle.first;
+                if (interp.m_max) {
+                    out.tries.back().maxAngle = interp.m_max->angle.first;
                 }
             }
             if (fabs(error) < maxError && !isConventional) {
