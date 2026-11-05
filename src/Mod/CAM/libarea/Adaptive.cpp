@@ -35,6 +35,9 @@
 #include <numbers>
 #include <set>
 #include <string>
+#include <chrono>
+#include <limits>
+#include <cstdlib>
 
 namespace ClipperLib
 {
@@ -1053,8 +1056,16 @@ public:
         toolRadiusScaled = p_toolRadiusScaled;
     };
 
+    // Investigation tooling (CutLoadDumper): when set and not suppressed, every change to this
+    // cleared area is applied to the mirror as well.
+    ClearedArea* mirror = nullptr;
+    bool mirrorSuppressed = false;
+
     void SetClearedPaths(const Paths& paths)
     {
+        if (mirror && !mirrorSuppressed) {
+            mirror->SetClearedPaths(paths);
+        }
         clearedPaths = paths;
         bboxPathsInvalid = true;
         bboxClippedInvalid = true;
@@ -1062,6 +1073,9 @@ public:
 
     void AddClearedPaths(const Paths& paths)
     {
+        if (mirror && !mirrorSuppressed) {
+            mirror->AddClearedPaths(paths);
+        }
         clip.Clear();
         clip.AddPaths(clearedPaths, PolyType::ptSubject, true);
         clip.AddPaths(paths, PolyType::ptClip, true);
@@ -1075,6 +1089,9 @@ public:
     {
         if (toClearToolPath.empty()) {
             return;
+        }
+        if (mirror && !mirrorSuppressed) {
+            mirror->ExpandCleared(toClearToolPath);
         }
         Perf_ExpandCleared.Start();
         clipof.Clear();
@@ -1160,8 +1177,503 @@ private:
 };
 
 //***************************************
+// Cut load dump (investigation tooling)
+//***************************************
+// Enabled by the environment variable ADAPTIVE_DUMP=<prefix>. Each call to Execute() writes
+// <prefix>.<n>.bin (n counts Execute calls in this process, from 0). For every cutting pass that is
+// emitted as output it records, as raw little-endian numbers:
+//   kind 0 COMPUTED:        the points as selected by the algorithm, with the cut area the
+//                           algorithm itself computed for each step (lagging cleared area)
+//   kind 1 COMPUTED_REPLAY: the same points, with areas recomputed against a replay of the
+//                           algorithm's cleared area schedule (validates the replay)
+//   kind 2 OUTPUT:          one point per computed point: the closest point to it on the output
+//                           (gcode, after CleanPath) segment that replaces it, so the two are in
+//                           1-1 correspondence. Areas against the output world's cleared area
+//                           (kind 7), replaying the algorithm's in-pass expansion schedule along
+//                           the output points.
+//   kind 5 CLEARED_START:   the algorithm's cleared area when the pass starts (the state the
+//                           COMPUTED areas of the pass start from, including the link into it).
+//                           Built from the computed points of all previous passes.
+//   kind 6 CLEARED_END:     the algorithm's cleared area when the pass ends (before the lead out)
+//   kind 7 OUTPUT_CLEARED_START, kind 8 OUTPUT_CLEARED_END: the same in the "output world": every
+//                           previous pass swept along its output (gcode) points instead of its
+//                           computed points; all other moves (links, leads, entry) identical.
+//   For kinds 5-8 the rows are polygon vertices: aux is the polygon index (clipper orientation;
+//   outer and hole polygons alternate by nesting) and area is 0.
+//   kind 9 COMPUTED_PERIMETER, kind 10 OUTPUT_PERIMETER: per point (step ending there; zeros for
+//                           the first point), the boundary of that step's cut region (circle(p_k)
+//                           - circle(p_{k-1}) - cleared, same cleared state as COMPUTED_REPLAY /
+//                           OUTPUT, as clipper polygons) split into: x = length on the previous
+//                           tool circle, y = length on the current tool circle, area = length of
+//                           the rest (cleared area boundary), all mm; aux = the polygon's area
+//                           (mm^2), a cross-check of the area computation.
+//   kind 11 COMPUTED_SEARCH: per computed point (step ending there; zeros for the first point), how
+//                           the algorithm's angle search for that step ended: x = exit reason (1
+//                           within tolerance, 2 best of two adjacent integer positions, 3
+//                           iteration limit, 4 no cut area), y = 1 if the point was then rotated
+//                           back inside the tool boundary (area recomputed), area = iterations.
+//   kind 12 SEARCH_TRIES_POS, kind 13 SEARCH_TRIES_INFO: for accepted steps whose search ended by
+//                           exit 2 (adjacent integers), and for the
+//                           failed search that ended the pass (keyed by point index n, one past
+//                           the last point), every candidate the search evaluated (CalcCutArea), in
+//                           order, one row per candidate in each kind. 12: x, y = candidate end point (mm), area
+//                           = its cut area (mm^2), aux = computed point index of the step. 13: x =
+//                           angle relative to the current tool direction (radians), y = 1 if the
+//                           cut was conventional, area = iteration number, aux = point index.
+//   kind 14 SEARCH_TRIES_BOUNDS: one row per try as in 12/13: x, y = the angles (radians) of the
+//                           interpolation's min and max bounds (interp.m_best / m_bound) after the try
+//                           was added (NaN if unset), aux = point index.
+//   kind 15 FAIL: one row about the search that ended the pass (from the last point): x = exit
+//                           reason, y = rotated, area = fail bits (1 area < 1, 2 conventional, 4
+//                           over cut, 8 could not rotate inside the boundary), aux = iterations.
+//   kind 16 LEAD_OUT: the lead out path after the pass (mm; area, aux 0); empty if none.
+//   kind 17 INITIAL_DIR: one row, x, y = the unit tool direction before the pass's first step (for
+//                           the first pass, coming out of the helix).
+// (Kinds 3 and 4 are unused.)
+//
+// File format:
+//   header: char[8] "ADPDUMP1", int32 version (1), int32 reserved (0), double scaleFactor
+//           (clipper units per mm), double toolDiameter (mm), double stepOverFactor,
+//           double optimalCutAreaPD (mm^2 per mm of travel)
+//   then pass records until end of file:
+//           char[4] "PASS", int32 region, int32 pass, int32 nVariants, then per variant:
+//           int32 kind, int32 nPoints, nPoints * {double x, double y, double area, double aux}
+//   x, y in mm; area (mm^2) is the area cut by the step from the previous point to this one (0 for
+//   the first point). aux: COMPUTED: the algorithm's error fraction for that step, negated if the
+//   step hit the iteration limit. OUTPUT: 1 for real output vertices, 0 otherwise. COMPUTED_REPLAY:
+//   0.
+namespace
+{
+struct CutLoadExpandEvent
+{
+    long afterSteps;  // number of accepted steps in the pass when this expansion happened
+    Path path;
+};
+
+enum CutLoadKind
+{
+    clkComputed = 0,
+    clkComputedReplay = 1,
+    clkOutput = 2,
+    clkClearedStart = 5,
+    clkClearedEnd = 6,
+    clkOutputClearedStart = 7,
+    clkOutputClearedEnd = 8,
+    clkComputedPerimeter = 9,
+    clkOutputPerimeter = 10,
+    clkComputedSearch = 11,
+    clkSearchTriesPos = 12,
+    clkSearchTriesInfo = 13,
+    clkSearchTriesBounds = 14,
+    clkFail = 15,
+    clkLeadOut = 16,
+    clkInitialDir = 17
+};
+
+struct CutLoadRow
+{
+    double x, y, area, aux;
+};
+
+class CutLoadDumper
+{
+public:
+    bool enabled = false;
+
+    void BeginExecute()
+    {
+        Close();
+        const char* prefix = getenv("ADAPTIVE_DUMP");
+        enabled = prefix && *prefix;
+        if (!enabled) {
+            return;
+        }
+        fileName = string(prefix) + "." + to_string(executeCount++) + ".bin";
+        headerWritten = false;
+        passesWritten = 0;
+        computedSteps = 0;
+        startTime = chrono::steady_clock::now();
+        file.open(fileName, ios::binary | ios::trunc);
+        if (!file) {
+            cerr << "ADAPTIVE_DUMP: failed to open " << fileName << endl;
+            enabled = false;
+            return;
+        }
+        cerr << "ADAPTIVE_DUMP: writing " << fileName << endl;
+    }
+
+    void EndExecute()
+    {
+        if (!enabled) {
+            return;
+        }
+        double elapsed = chrono::duration<double>(chrono::steady_clock::now() - startTime).count();
+        cerr << "ADAPTIVE_DUMP: done " << fileName << ": " << passesWritten << " passes, "
+             << computedSteps << " steps, " << elapsed << " s" << endl;
+        Close();
+    }
+
+    // Called for each emitted cutting pass.
+    template<class CutAreaFn>
+    void DumpPass(
+        int region,
+        int pass,
+        long scaleFactor,
+        double toolDiameter,
+        double stepOverFactor,
+        double optimalCutAreaPD,
+        long toolRadiusScaled,
+        const Paths& passStartCleared,
+        const Paths& passEndCleared,
+        const Paths& outputStartCleared,
+        const Paths& outputEndCleared,
+        const Path& computed,
+        const vector<double>& computedAreas,
+        const vector<double>& computedAux,
+        const vector<CutLoadRow>& search,
+        const vector<CutLoadRow>& triesPos,
+        const vector<CutLoadRow>& triesInfo,
+        const vector<CutLoadRow>& triesBounds,
+        const CutLoadRow& fail,
+        const DoublePoint& initialDir,
+        const DPath& leadOut,
+        const vector<CutLoadExpandEvent>& events,
+        const Path& output,
+        CutAreaFn cutArea
+    )
+    {
+        if (!enabled || computed.size() < 2 || computedAreas.size() + 1 != computed.size()) {
+            if (enabled && computed.size() >= 2) {
+                cerr << "ADAPTIVE_DUMP: pass " << pass << " skipped, " << computedAreas.size()
+                     << " areas for " << computed.size() << " points" << endl;
+            }
+            return;
+        }
+        const double s = double(scaleFactor);
+        const double s2 = s * s;
+        if (!headerWritten) {
+            file.write("ADPDUMP1", 8);
+            WriteI(1);
+            WriteI(0);  // reserved
+            WriteD(s);
+            WriteD(toolDiameter);
+            WriteD(stepOverFactor);
+            WriteD(optimalCutAreaPD / s);
+            headerWritten = true;
+        }
+
+        const size_t n = computed.size();  // points; steps are 1..n-1
+
+        // --- output points in 1-1 correspondence with the computed points ---
+        // Output vertices are (normally) a subset of the computed points. Map each to its computed
+        // index; then each computed point j between output vertices k-1 and k (by index) maps to
+        // its closest point on the output segment k-1 -> k.
+        vector<long> outIdx;
+        {
+            size_t search = 0;
+            for (const IntPoint& q : output) {
+                long found = -1;
+                for (size_t j = search; j < n; j++) {
+                    if (computed[j] == q) {
+                        found = long(j);
+                        break;
+                    }
+                }
+                if (found < 0) {
+                    // not one of the computed points: use the nearest one at or after the search
+                    double best = __DBL_MAX__;
+                    for (size_t j = search; j < n; j++) {
+                        double d = DistanceSqrd(computed[j], q);
+                        if (d < best) {
+                            best = d;
+                            found = long(j);
+                        }
+                    }
+                    if (found < 0) {
+                        found = long(n - 1);
+                    }
+                }
+                outIdx.push_back(found);
+                search = size_t(found);
+            }
+        }
+        struct SubPoint
+        {
+            IntPoint pt;
+            long rawStep;  // computed step index whose cleared state applies to the step ending here
+            bool vertex;
+        };
+        vector<SubPoint> sub;
+        if (!output.empty()) {
+            size_t k = 0;  // output vertex index: computed point j lies in output segment k -> k+1
+            for (size_t j = 0; j < n; j++) {
+                while (k + 1 < output.size() && long(j) > outIdx[k + 1]) {
+                    k++;
+                }
+                bool vertex = false;
+                for (long v : outIdx) {
+                    vertex |= v == long(j);
+                }
+                IntPoint pt;
+                if (k + 1 >= output.size() || long(j) < outIdx[0]) {
+                    pt = long(j) < outIdx[0] ? output.front() : output.back();
+                }
+                else {
+                    const IntPoint& A = output[k];
+                    const IntPoint& B = output[k + 1];
+                    double abx = double(B.X - A.X), aby = double(B.Y - A.Y);
+                    double l2 = abx * abx + aby * aby;
+                    double t = l2 > 0
+                        ? ((computed[j].X - A.X) * abx + (computed[j].Y - A.Y) * aby) / l2
+                        : 0;
+                    t = max(0.0, min(1.0, t));
+                    pt = IntPoint(llround(A.X + abx * t), llround(A.Y + aby * t));
+                }
+                sub.push_back({pt, long(j), vertex});
+            }
+        }
+
+        // --- lagging replay: state for computed step k = snapshot + events with afterSteps <= k-1
+        // expandEvent(replay, event): apply one of the algorithm's in-pass expansions
+        // perims (optional): also record each step's cut region perimeter split (CutPerimeter)
+        const auto replayAreas = [&](const Paths& start,
+                                     const vector<pair<IntPoint, IntPoint>>& steps,
+                                     const vector<long>& rawStepOf,
+                                     const auto& expandEvent,
+                                     vector<CutLoadRow>* perims = nullptr) {
+            ClearedArea replay(toolRadiusScaled);
+            replay.SetClearedPaths(start);
+            size_t ev = 0;
+            vector<double> areas;
+            areas.reserve(steps.size());
+            for (size_t i = 0; i < steps.size(); i++) {
+                while (ev < events.size() && events[ev].afterSteps <= rawStepOf[i] - 1) {
+                    expandEvent(replay, events[ev]);
+                    ev++;
+                }
+                areas.push_back(cutArea(steps[i].first, steps[i].second, replay));
+                if (perims) {
+                    perims->push_back(
+                        CutPerimeter(steps[i].first, steps[i].second, toolRadiusScaled, replay, s)
+                    );
+                }
+            }
+            return areas;
+        };
+
+        vector<pair<IntPoint, IntPoint>> compSteps;
+        vector<long> compRaw;
+        for (size_t k = 1; k < n; k++) {
+            compSteps.emplace_back(computed[k - 1], computed[k]);
+            compRaw.push_back(long(k));
+        }
+        vector<pair<IntPoint, IntPoint>> outSteps;
+        vector<long> outRaw;
+        for (size_t i = 1; i < sub.size(); i++) {
+            outSteps.emplace_back(sub[i - 1].pt, sub[i].pt);
+            outRaw.push_back(sub[i].rawStep);
+        }
+        computedSteps += long(compSteps.size());
+
+        // computed world: the algorithm's own expansions
+        vector<CutLoadRow> compPerims, outPerims;
+        vector<double> compReplay = replayAreas(
+            passStartCleared,
+            compSteps,
+            compRaw,
+            [](ClearedArea& c, const CutLoadExpandEvent& e) { c.ExpandCleared(e.path); },
+            &compPerims
+        );
+        // output world: an expansion after computed step c covers the output points up to the
+        // last subdivision point belonging to computed step <= c, from where the last one ended
+        size_t lastSub = 0;
+        vector<double> outReplay = replayAreas(
+            outputStartCleared,
+            outSteps,
+            outRaw,
+            [&](ClearedArea& c, const CutLoadExpandEvent& e) {
+                size_t j = lastSub;
+                while (j + 1 < sub.size() && sub[j + 1].rawStep <= e.afterSteps) {
+                    j++;
+                }
+                if (j > lastSub) {
+                    Path p;
+                    for (size_t i = lastSub; i <= j; i++) {
+                        p.push_back(sub[i].pt);
+                    }
+                    c.ExpandCleared(p);
+                    lastSub = j;
+                }
+            },
+            &outPerims
+        );
+
+        const auto computedRows = [&](const vector<double>& areas, const vector<double>* aux) {
+            vector<CutLoadRow> rows;
+            rows.push_back({computed[0].X / s, computed[0].Y / s, 0, 0});
+            for (size_t k = 1; k < n; k++) {
+                rows.push_back(
+                    {computed[k].X / s, computed[k].Y / s, areas[k - 1] / s2, aux ? (*aux)[k - 1] : 0}
+                );
+            }
+            return rows;
+        };
+        const auto outputRows = [&](const vector<double>& areas) {
+            vector<CutLoadRow> rows;
+            for (size_t i = 0; i < sub.size(); i++) {
+                rows.push_back(
+                    {sub[i].pt.X / s,
+                     sub[i].pt.Y / s,
+                     i == 0 ? 0 : areas[i - 1] / s2,
+                     sub[i].vertex ? 1.0 : 0.0}
+                );
+            }
+            return rows;
+        };
+
+        vector<pair<int, vector<CutLoadRow>>> variants;
+        variants.emplace_back(clkComputed, computedRows(computedAreas, &computedAux));
+        variants.emplace_back(clkComputedReplay, computedRows(compReplay, nullptr));
+        variants.emplace_back(clkOutput, outputRows(outReplay));
+        const auto polygonRows = [&](const Paths& polys) {
+            vector<CutLoadRow> rows;
+            for (size_t i = 0; i < polys.size(); i++) {
+                for (const IntPoint& pt : polys[i]) {
+                    rows.push_back({pt.X / s, pt.Y / s, 0, double(i)});
+                }
+            }
+            return rows;
+        };
+        variants.emplace_back(clkClearedStart, polygonRows(passStartCleared));
+        variants.emplace_back(clkClearedEnd, polygonRows(passEndCleared));
+        variants.emplace_back(clkOutputClearedStart, polygonRows(outputStartCleared));
+        variants.emplace_back(clkOutputClearedEnd, polygonRows(outputEndCleared));
+        const auto perimRows = [](const vector<CutLoadRow>& perims) {
+            vector<CutLoadRow> rows {{0, 0, 0, 0}};
+            rows.insert(rows.end(), perims.begin(), perims.end());
+            return rows;
+        };
+        variants.emplace_back(clkComputedPerimeter, perimRows(compPerims));
+        variants.emplace_back(clkComputedSearch, perimRows(search));
+        variants.emplace_back(clkSearchTriesPos, triesPos);
+        variants.emplace_back(clkSearchTriesInfo, triesInfo);
+        variants.emplace_back(clkSearchTriesBounds, triesBounds);
+        variants.emplace_back(clkFail, vector<CutLoadRow> {fail});
+        variants.emplace_back(clkInitialDir, vector<CutLoadRow> {{initialDir.X, initialDir.Y, 0, 0}});
+        {
+            vector<CutLoadRow> rows;
+            for (const DPoint& q : leadOut) {
+                rows.push_back({q.first, q.second, 0, 0});
+            }
+            variants.emplace_back(clkLeadOut, rows);
+        }
+        variants.emplace_back(clkOutputPerimeter, perimRows(outPerims));
+
+        file.write("PASS", 4);
+        WriteI(region);
+        WriteI(pass);
+        WriteI(int(variants.size()));
+        for (const auto& [kind, rows] : variants) {
+            WriteI(kind);
+            WriteI(int(rows.size()));
+            for (const auto& r : rows) {
+                WriteD(r.x);
+                WriteD(r.y);
+                WriteD(r.area);
+                WriteD(r.aux);
+            }
+        }
+        file.flush();
+        passesWritten++;
+    }
+
+private:
+    // Cut region of the step c1 -> c2 (circle(c2) - circle(c1) - cleared) as clipper polygons; its
+    // boundary split into lengths on the previous circle, on the current circle, and the rest (mm),
+    // returned as {prev, cur, other, polygon area mm^2}. An edge belongs to a circle if its midpoint
+    // is within 1.6 units of the circle's radius (the cleared area's swept circles are grown by 1
+    // unit, so the boundary of the cleared area around c1 itself counts as the previous circle).
+    static CutLoadRow CutPerimeter(
+        const IntPoint& c1,
+        const IntPoint& c2,
+        long R,
+        ClearedArea& cleared,
+        double s
+    )
+    {
+        const int N = 2880;  // circle polygon: sagitta R * (1 - cos(pi / N)) << 1 unit
+        const auto circle = [&](const IntPoint& c) {
+            Path p;
+            for (int i = 0; i < N; i++) {
+                double a = 2 * std::numbers::pi * i / N;
+                p.push_back(IntPoint(llround(c.X + R * cos(a)), llround(c.Y + R * sin(a))));
+            }
+            return p;
+        };
+        Clipper clip;
+        clip.AddPath(circle(c2), PolyType::ptSubject, true);
+        clip.AddPath(circle(c1), PolyType::ptClip, true);
+        clip.AddPaths(cleared.GetBoundedClearedAreaClipped(c2, int(R + 4)), PolyType::ptClip, true);
+        Paths cut;
+        clip.Execute(ClipType::ctDifference, cut, PolyFillType::pftNonZero, PolyFillType::pftNonZero);
+        const double tol = 1.6;
+        double lPrev = 0, lCur = 0, lOther = 0, area = 0;
+        for (const Path& poly : cut) {
+            area += Area(poly);
+            for (size_t i = 0; i < poly.size(); i++) {
+                const IntPoint& a = poly[i];
+                const IntPoint& b = poly[(i + 1) % poly.size()];
+                double mx = 0.5 * (double(a.X) + double(b.X)), my = 0.5 * (double(a.Y) + double(b.Y));
+                double len = sqrt(double(DistanceSqrd(a, b)));
+                double d1 = sqrt((mx - c1.X) * (mx - c1.X) + (my - c1.Y) * (my - c1.Y));
+                double d2 = sqrt((mx - c2.X) * (mx - c2.X) + (my - c2.Y) * (my - c2.Y));
+                if (fabs(d1 - R) < tol) {
+                    lPrev += len;
+                }
+                else if (fabs(d2 - R) < tol) {
+                    lCur += len;
+                }
+                else {
+                    lOther += len;
+                }
+            }
+        }
+        return {lPrev / s, lCur / s, lOther / s, area / (s * s)};
+    }
+
+    ofstream file;
+    string fileName;
+    int executeCount = 0;
+    bool headerWritten = false;
+    long passesWritten = 0;
+    long computedSteps = 0;
+    chrono::steady_clock::time_point startTime;
+
+    void WriteI(int32_t v)
+    {
+        file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    void WriteD(double v)
+    {
+        file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    }
+    void Close()
+    {
+        if (file.is_open()) {
+            file.close();
+        }
+    }
+};
+
+CutLoadDumper cutLoadDumper;
+}  // namespace
+
+//***************************************
 // Linear Interpolation - area vs angle
 //***************************************
+// The goal of the point search is to find the angle that produces the largest possible
+// non-conventional cut without exceding the target area. This helper class guides that
+// search
 struct InterpItem
 {
     std::pair<double, IntPoint> angle;
@@ -1874,6 +2386,7 @@ std::list<AdaptiveOutput> Adaptive2d::Execute(
     scaleFactor = MIN_STEP_CLIPPER / tolerance / min(1.0, stepOverFactor * toolDiameter);
 
     current_region = 0;
+    cutLoadDumper.BeginExecute();
     cout << "Tool Diameter: " << toolDiameter << endl;
     cout << "Min step size: " << round(MIN_STEP_CLIPPER / scaleFactor * 1000 * 10) / 10 << " um"
          << endl;
@@ -2601,6 +3114,7 @@ std::list<AdaptiveOutput> Adaptive2d::Execute(
     UNUSED(svgInfo);
 #endif
 
+    cutLoadDumper.EndExecute();
     return results;
 }
 
@@ -3531,6 +4045,19 @@ Paths PathIntersectArea(Clipper& clip, Path& subject, Paths& obj, bool isClosed 
     return result;
 }
 
+// one candidate evaluated by the angle search (cut load dump)
+struct SearchTry
+{
+    double angle;  // relative to the current tool direction (radians)
+    IntPoint pos;
+    double area;
+    bool conventional;
+    int iteration;
+    // interpolation bounds after this try was added (angles; NaN if unset)
+    double minAngle = std::numeric_limits<double>::quiet_NaN();
+    double maxAngle = std::numeric_limits<double>::quiet_NaN();
+};
+
 struct IterateNextStepOutput
 {
     std::optional<double> iterationAngle;
@@ -3540,6 +4067,15 @@ struct IterateNextStepOutput
     double errorFraction;
     IntPoint newToolPos;
     DoublePoint newToolDir;
+    // how the angle search ended (cut load dump): 1 within tolerance, 2 adjacent integer positions
+    // (best of the two), 3 iteration limit, 4 no cut area found
+    int exitReason = 3;
+    bool rotated = false;  // rotated back inside the tool boundary afterwards (area recomputed)
+    int iterations = 0;
+    vector<SearchTry> tries;  // every evaluated candidate, in order (only if dumping)
+    // why the step failed (cut load dump): 1 area < 1, 2 conventional, 4 over cut (> 2x target),
+    // 8 could not rotate back inside the tool boundary
+    int failBits = 0;
 };
 
 void Adaptive2d::ProcessPolyNode(
@@ -3585,6 +4121,12 @@ void Adaptive2d::ProcessPolyNode(
     // Initialize cleared area from previously cleared paths
     ClearedArea cleared(toolRadiusScaled);
     cleared.SetClearedPaths(initialClearedPaths);
+    // cut load dump: the cleared area as the output (gcode) paths would leave it (see CutLoadDumper)
+    ClearedArea outputCleared(toolRadiusScaled);
+    if (cutLoadDumper.enabled) {
+        outputCleared.SetClearedPaths(initialClearedPaths);
+        cleared.mirror = &outputCleared;
+    }
 
     CheckReportProgress(progressPaths, true);
 
@@ -3617,6 +4159,35 @@ void Adaptive2d::ProcessPolyNode(
     clearedBeforePass.SetClearedPaths(cleared.GetCleared());
 
     DoublePoint lastExpandToolDir = toolDir;
+
+    // cut load dump state for the current pass (see CutLoadDumper)
+    bool dumpInPass = false;
+    long dumpPassIndex = 0;
+    Paths dumpPassStartCleared;
+    Paths dumpOutputStartCleared;
+    vector<double> dumpAreas;
+    vector<double> dumpAux;
+    vector<CutLoadRow> dumpSearch;  // per accepted step: {exit reason, rotated, iterations, 0}
+    vector<CutLoadRow> dumpTriesPos;   // exit 2 steps' tries: {x, y, area, point index}
+    vector<CutLoadRow> dumpTriesInfo;  // {angle, conventional, iteration, point index}
+    vector<CutLoadRow> dumpTriesBounds;  // {interp min angle, interp max angle, 0, point index}
+    CutLoadRow dumpFail {0, 0, 0, 0};
+    DoublePoint dumpInitialDir {0, 0};  // tool direction before the pass's first step    // {exit reason, rotated, fail bits, iterations} of the last search
+    const auto dumpRecordTries = [&](const IterateNextStepOutput& r, double k) {
+        const double s = double(scaleFactor);
+        for (const SearchTry& t : r.tries) {
+            dumpTriesPos.push_back({t.pos.X / s, t.pos.Y / s, t.area / (s * s), k});
+            dumpTriesInfo.push_back({t.angle, t.conventional ? 1.0 : 0.0, double(t.iteration), k});
+            dumpTriesBounds.push_back({t.minAngle, t.maxAngle, 0, k});
+        }
+    };
+    vector<CutLoadExpandEvent> dumpEvents;
+    const auto expandClearedLogged = [&](const Path& p) {
+        if (dumpInPass && !p.empty()) {
+            dumpEvents.push_back({long(dumpAreas.size()), p});
+        }
+        cleared.ExpandCleared(p);
+    };
 
     const auto iterateNextStep = [&](const IntPoint& toolPos,
                                      const DoublePoint& toolDir,
@@ -3698,7 +4269,7 @@ void Adaptive2d::ProcessPolyNode(
             }
             else if (iteration == 3 && !foundArea) {
                 // Expand cleared area
-                cleared.ExpandCleared(toClearPath);
+                expandClearedLogged(toClearPath);
                 toClearPath.clear();
                 lastExpandToolDir = toolDir;
 
@@ -3748,6 +4319,7 @@ void Adaptive2d::ProcessPolyNode(
                 angle = 0;
                 area = 0;
                 areaPD = 0;
+                out.exitReason = 4;
                 break;
             }
             else {
@@ -3795,6 +4367,7 @@ void Adaptive2d::ProcessPolyNode(
                     areaPD = error + targetAreaPD;
                     area = areaPD * sqrt(DistanceSqrd(toolPos, newToolPos));
                     out.iterationAngle = angle;
+                    out.exitReason = 2;
                     break;
                 }
                 continue;
@@ -3808,13 +4381,25 @@ void Adaptive2d::ProcessPolyNode(
             if (area > 0) {
                 foundArea = true;
             }
+            if (cutLoadDumper.enabled) {
+                out.tries.push_back({angle, newToolPos, area, isConventional, iteration});
+            }
 
             areaPD = area / sqrt(DistanceSqrd(toolPos, newToolPos));  // area per distance
             double error = areaPD - targetAreaPD;
             errorFraction = abs(error / optimalCutAreaPD);
             interp.addPoint(error, {angle, newToolPos}, pointNotInterp, isConventional);
+            if (cutLoadDumper.enabled && !out.tries.empty()) {
+                if (interp.m_best) {
+                    out.tries.back().minAngle = interp.m_best->angle.first;
+                }
+                if (interp.m_bound) {
+                    out.tries.back().maxAngle = interp.m_bound->angle.first;
+                }
+            }
             if (fabs(error) < maxError && !isConventional) {
                 out.iterationAngle = angle;
+                out.exitReason = 1;
                 break;
             }
             if (iteration == MAX_ITERATIONS - 1) {
@@ -3822,6 +4407,7 @@ void Adaptive2d::ProcessPolyNode(
             }
         }
         Perf_PointIterations.Stop();
+        out.iterations = min(iteration + 1, MAX_ITERATIONS);
 
         bool recalcArea = false;
 
@@ -3854,6 +4440,7 @@ void Adaptive2d::ProcessPolyNode(
                 );
             }
             if (rotateStep >= 180) {
+                out.failBits |= 8;
 #ifdef DEV_MODE
                 if (warnRotate) {
                     output.UnexpectedRotateIterations = true;
@@ -3880,14 +4467,17 @@ void Adaptive2d::ProcessPolyNode(
             // safety condition
             if (area > sqrt(DistanceSqrd(toolPos, newToolPos)) * optimalCutAreaPD
                 && areaPD > 2 * optimalCutAreaPD) {
+                out.failBits |= 4;
                 over_cut_count++;
                 out.failed = true;
             }
         }
 
+        out.rotated = recalcArea;
         out.area = area;
         out.failed |= isConventional;
         out.failed |= area < 1;
+        out.failBits |= (area < 1 ? 1 : 0) | (isConventional ? 2 : 0);
         out.newToolPos = newToolPos;
         out.newToolDir = newToolDir;
         out.errorFraction = errorFraction;
@@ -4224,6 +4814,22 @@ void Adaptive2d::ProcessPolyNode(
             gyro.push_back(toolDir);
         }
 
+        if (cutLoadDumper.enabled) {
+            dumpInPass = true;
+            dumpInitialDir = toolDir;
+            dumpPassStartCleared = cleared.GetCleared();
+            dumpOutputStartCleared = outputCleared.GetCleared();
+            cleared.mirrorSuppressed = true;  // the output world gets the output path instead
+            dumpAreas.clear();
+            dumpAux.clear();
+            dumpSearch.clear();
+            dumpTriesPos.clear();
+            dumpTriesInfo.clear();
+            dumpTriesBounds.clear();
+            dumpFail = {0, 0, 0, 0};
+            dumpEvents.clear();
+        }
+
         //*******************************
         // LOOP - POINTS
         //*******************************
@@ -4242,6 +4848,21 @@ void Adaptive2d::ProcessPolyNode(
             }
 
             if (!itResult.failed) {  // cut is ok - record it
+                if (dumpInPass) {
+                    dumpAreas.push_back(itResult.area);
+                    dumpAux.push_back(
+                        itResult.tooManyIterations ? -itResult.errorFraction : itResult.errorFraction
+                    );
+                    dumpSearch.push_back(
+                        {double(itResult.exitReason),
+                         itResult.rotated ? 1.0 : 0.0,
+                         double(itResult.iterations),
+                         0}
+                    );
+                    if (itResult.exitReason == 2) {
+                        dumpRecordTries(itResult, double(dumpAreas.size()));
+                    }
+                }
                 if (itResult.iterationAngle) {
                     angleHistory.push_back(*itResult.iterationAngle);
                     if (angleHistory.size() > ANGLE_HISTORY_POINTS) {
@@ -4255,7 +4876,7 @@ void Adaptive2d::ProcessPolyNode(
                 if (lastExpandToolDir.X * itResult.newToolDir.X
                         + lastExpandToolDir.Y * itResult.newToolDir.Y
                     < cos(std::numbers::pi / 4)) {
-                    cleared.ExpandCleared(toClearPath);
+                    expandClearedLogged(toClearPath);
                     toClearPath.clear();
                     lastExpandToolDir = toolDir;
                 }
@@ -4291,6 +4912,17 @@ void Adaptive2d::ProcessPolyNode(
             }
             else {
                 // cout<<"Break: no cut @" << point_index << endl;
+                if (dumpInPass) {
+                    // the search that ended the pass, from the last point: its tries are keyed by
+                    // the point index the step would have ended at
+                    dumpRecordTries(itResult, double(dumpAreas.size() + 1));
+                    dumpFail = {
+                        double(itResult.exitReason),
+                        itResult.rotated ? 1.0 : 0.0,
+                        double(itResult.failBits),
+                        double(itResult.iterations)
+                    };
+                }
                 break;
             }
         } /* end of points loop*/
@@ -4299,6 +4931,8 @@ void Adaptive2d::ProcessPolyNode(
             cleared.ExpandCleared(toClearPath);
             toClearPath.clear();
         }
+        dumpInPass = false;
+        cleared.mirrorSuppressed = false;
 
         Paths newlyClearedAreas;
         clip.Clear();
@@ -4315,7 +4949,49 @@ void Adaptive2d::ProcessPolyNode(
             Path cleaned;
             CleanPath(passToolPath, cleaned, CLEAN_PATH_TOLERANCE);
             total_output_points += long(cleaned.size());
+            Paths dumpPassEndCleared, dumpOutputEndCleared;
+            if (cutLoadDumper.enabled) {
+                outputCleared.ExpandCleared(cleaned);
+                dumpPassEndCleared = cleared.GetCleared();
+                dumpOutputEndCleared = outputCleared.GetCleared();
+            }
+            const size_t dumpLeadOutFrom = output.AdaptivePaths.size() + linkPath.size() + 1;
             auto newPos = AppendToolPath(output, cleaned, linkPath, cleared, toolBoundPaths);
+            if (cutLoadDumper.enabled) {
+                // the lead out is what AppendToolPath added after the cut path
+                DPath leadOut;
+                for (size_t i = dumpLeadOutFrom; i < output.AdaptivePaths.size(); i++) {
+                    leadOut.insert(leadOut.end(), output.AdaptivePaths[i].second.begin(), output.AdaptivePaths[i].second.end());
+                }
+                cutLoadDumper.DumpPass(
+                    current_region,
+                    int(dumpPassIndex++),
+                    scaleFactor,
+                    toolDiameter,
+                    stepOverFactor,
+                    optimalCutAreaPD,
+                    toolRadiusScaled,
+                    dumpPassStartCleared,
+                    dumpPassEndCleared,
+                    dumpOutputStartCleared,
+                    dumpOutputEndCleared,
+                    passToolPath,
+                    dumpAreas,
+                    dumpAux,
+                    dumpSearch,
+                    dumpTriesPos,
+                    dumpTriesInfo,
+                    dumpTriesBounds,
+                    dumpFail,
+                    dumpInitialDir,
+                    leadOut,
+                    dumpEvents,
+                    cleaned,
+                    [this](const IntPoint& a, const IntPoint& b, ClearedArea& c) {
+                        return CalcCutArea(a, b, c).first;
+                    }
+                );
+            }
             if (newPos) {
                 toolPos = newPos->first;
                 toolDir = newPos->second;
