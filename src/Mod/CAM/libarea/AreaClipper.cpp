@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <format>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -307,6 +308,11 @@ void CArea::Debug_IntersectOpenPathReversal(
 // edge. A tag of 0 indicates that the segment is an end cap. 1 indicates that it was produced by
 // offsetting in the requested/positive direction, and -1 indicates that it was produced by
 // offsetting in the opposite/negative direction.
+//
+// If an input curve has m_edgeIds, the output curve's m_edgeIds are populated as well: each offset
+// segment gets the id of the input edge it was offset from. Joins (at the vertex between input
+// edges a and b) get a's id if both a and b have nonzero ids, otherwise 0. End caps get the id of
+// the adjacent end edge.
 void CArea::NaiveOffset(double offset)
 {
     // Positive oriented curves should be CCW (positive area) but some callers use the
@@ -355,6 +361,28 @@ void CArea::NaiveOffset(double offset)
         // forwards, so cNeg will need to be reversed later. End caps will be handled later
         CCurve cPos;
         CCurve cNeg;
+
+        // Edge id tracking. ids are only tracked if the input curve has them
+        const bool trackIds = !curve.m_edgeIds.empty();
+        const std::vector<int> inIds(curve.m_edgeIds.begin(), curve.m_edgeIds.end());
+        auto idAt = [&](int i) {
+            return (i >= 0 && i < (int)inIds.size()) ? inIds[i] : 0;
+        };
+        auto joinId = [](int prevId, int nextId) {
+            return (prevId != 0 && nextId != 0) ? prevId : 0;
+        };
+        // Fill c.m_edgeIds with `id` until there is one id per edge
+        auto padIds = [&](CCurve& c, int id) {
+            if (!trackIds) {
+                return;
+            }
+            while (c.m_edgeIds.size() + 1 < c.m_vertices.size()) {
+                c.m_edgeIds.push_back(id);
+            }
+        };
+        int edgeIdx = -1;
+        int firstEdgeId = 0;  // id of the first non-degenerate input edge
+        int prevEdgeId = 0;   // id of the previous non-degenerate input edge
         double startDirX = 0, startDirY = 0, startQex = 0;  // initialized below
         double prevDirX = 0, prevDirY = 0;                  // initialized below
         heeks::Point pPrev = curve.m_vertices.front().m_p;
@@ -445,6 +473,8 @@ void CArea::NaiveOffset(double offset)
 
         for (auto it = std::next(curve.m_vertices.begin()); it != curve.m_vertices.end(); ++it) {
             const CVertex& v = *it;
+            ++edgeIdx;
+            const int edgeId = idAt(edgeIdx);
 
             // Compute segment start and end normal and tangent directions. Normalize length to offset
             double sTanX, sTanY;    // tangent vector at the start point
@@ -508,11 +538,14 @@ void CArea::NaiveOffset(double offset)
                 cNeg.m_vertices.emplace_back(0, pNegS, Point(0, 0));
                 std::tie(startDirX, startDirY) = std::make_pair(sTanX, sTanY);
                 startQex = exitQ;
+                firstEdgeId = edgeId;
             }
 
             // Join from the previous segment, if there is one
             if (hasPrev) {
                 addJoin(pPosS, pNegS, pPrev, prevDirX, prevDirY, sTanX, sTanY, enterQ, exitQ);
+                padIds(cPos, joinId(prevEdgeId, edgeId));
+                padIds(cNeg, joinId(prevEdgeId, edgeId));
             }
             enterQ = v.m_type == 0 ? 0 : v.m_type / sRadius;
 
@@ -547,8 +580,11 @@ void CArea::NaiveOffset(double offset)
                     cNeg.m_vertices.emplace_back(v.m_type, pNegE, v.m_c);
                 }
             }
+            padIds(cPos, edgeId);
+            padIds(cNeg, edgeId);
 
             // Update state variables
+            prevEdgeId = edgeId;
             pPrev = v.m_p;
             std::tie(prevDirX, prevDirY) = std::make_pair(eTanX, eTanY);
         }
@@ -559,6 +595,8 @@ void CArea::NaiveOffset(double offset)
             const heeks::Point pPosStart = cPos.m_vertices.front().m_p;
             const heeks::Point pNegStart = cNeg.m_vertices.front().m_p;
             addJoin(pPosStart, pNegStart, pPrev, prevDirX, prevDirY, startDirX, startDirY, enterQ, startQex);
+            padIds(cPos, joinId(prevEdgeId, firstEdgeId));
+            padIds(cNeg, joinId(prevEdgeId, firstEdgeId));
 
             // curve.IsClosed() allows for start/end mismatch by some tolerance, but we really want
             // to produce a curve that is actually closed here. Coerce the start point to match the
@@ -594,16 +632,22 @@ void CArea::NaiveOffset(double offset)
             // Append the first end cap
             cPos.m_vertices.emplace_back(1, cNeg.m_vertices.begin()->m_p, curve.m_vertices.back().m_p);
             cPos.m_edgeTags.push_back(0);
+            padIds(cPos, prevEdgeId);
 
             // Concatenate cNeg
             for (auto it = std::next(cNeg.m_vertices.begin()); it != cNeg.m_vertices.end(); ++it) {
                 cPos.m_vertices.push_back(*it);
                 cPos.m_edgeTags.push_back(-1);
             }
+            if (trackIds) {
+                cPos.m_edgeIds
+                    .insert(cPos.m_edgeIds.end(), cNeg.m_edgeIds.begin(), cNeg.m_edgeIds.end());
+            }
 
             // Append the final end cap
             cPos.m_vertices.emplace_back(1, cPos.m_vertices.begin()->m_p, curve.m_vertices.front().m_p);
             cPos.m_edgeTags.push_back(0);
+            padIds(cPos, firstEdgeId);
 
             // Save results to the output list
             offset_curves.push_back(cPos);
@@ -653,6 +697,11 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
     heeks::Point ptPrev = curve.m_vertices.front().m_p;
     assert(curve.m_edgeTags.empty() || curve.m_edgeTags.size() == curve.m_vertices.size() - 1);
     auto tagIt = curve.m_edgeTags.cbegin();
+    assert(curve.m_edgeIds.empty() || curve.m_edgeIds.size() == curve.m_vertices.size() - 1);
+    auto idIt = curve.m_edgeIds.cbegin();
+    if (!curve.m_edgeIds.empty()) {
+        metadata.hasEdgeIds = true;
+    }
     int vertexIndex = 0;
 
     // Iterate through edges
@@ -668,6 +717,7 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
             vertex.m_p = curve.m_vertices.front().m_p;
         }
         const int edgeTag = tagIt != curve.m_edgeTags.cend() ? *tagIt : 1;
+        const int edgeId = idIt != curve.m_edgeIds.cend() ? *idIt : 0;
 
         if (vertex.m_type == 0) {
             // The current edge is a line segment; add a single point to clipper
@@ -680,7 +730,7 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
 
             // Save metadata for the new segment
             const auto key = std::make_pair(std::min(pPrev.z, newPt.z), std::max(pPrev.z, newPt.z));
-            metadata.edgeData[key] = SegmentData {vertex, edgeTag, curveIndex, vertexIndex};
+            metadata.edgeData[key] = SegmentData {vertex, edgeTag, curveIndex, vertexIndex, edgeId};
             metadata.edges[pPrev.z].push_back(newPt.z);
             metadata.edges[newPt.z].push_back(pPrev.z);
             pPrev = newPt;
@@ -745,7 +795,7 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
                 }
 
                 const auto key = std::make_pair(std::min(pPrev.z, newPt.z), std::max(pPrev.z, newPt.z));
-                metadata.edgeData[key] = SegmentData {vertex, edgeTag, curveIndex, vertexIndex};
+                metadata.edgeData[key] = SegmentData {vertex, edgeTag, curveIndex, vertexIndex, edgeId};
                 metadata.edges[pPrev.z].push_back(newPt.z);
                 metadata.edges[newPt.z].push_back(pPrev.z);
                 pPrev = newPt;
@@ -757,6 +807,9 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
         if (tagIt != curve.m_edgeTags.cend()) {
             tagIt++;
         }
+        if (idIt != curve.m_edgeIds.cend()) {
+            idIt++;
+        }
     }
 
     return result;
@@ -766,6 +819,8 @@ Path64 CArea::MakePoly(const CCurve& curve, ConversionMetadata& metadata) const
 // In getParentMetadataFallback, we may need to reconstruct a fake parent node for unknown parent
 // edges (fall back to connecting with a line). We use this tag sentinel value in that case.
 const int tagSentinel = -2;
+// Likewise for unknown edge ids
+const int idSentinel = std::numeric_limits<int>::min();
 
 // Convert the provided clipper paths back to CArea/CCurve data, using metadata to correctly
 // infer edge type (arc/line) and arc center information. Only edges tagged 1 (i.e. positive offset
@@ -788,6 +843,9 @@ void CArea::SetFromResult(
         ReorderOpenPaths(paths, metadata);
     }
 
+    // If any input curve had edge ids, maintain m_edgeIds on every output curve (one per edge)
+    const bool trackIds = metadata.hasEdgeIds;
+
     // Convert each path back to a CCurve
     for (const Path64& path : paths) {
         if (!path.size()) {
@@ -808,6 +866,7 @@ void CArea::SetFromResult(
         // closed curves) the first curve and its tag.
         CCurve c;
         int tag = tagSentinel;
+        int prevId = 0;  // edge id of the most recently processed (non-skipped) edge
         CCurve* firstCurve = nullptr;
         std::optional<int> firstTag;
 
@@ -886,6 +945,9 @@ void CArea::SetFromResult(
                     else if (c.m_vertices.back().m_type == 0) {
                         // Collapsed a line to its start point -- delete the vertex
                         c.m_vertices.pop_back();
+                        if (trackIds) {
+                            c.m_edgeIds.pop_back();
+                        }
                     }
                     else {
                         // Completed an arc -- change the representation to two semi-circles
@@ -893,6 +955,9 @@ void CArea::SetFromResult(
                         const heeks::Point mid {2 * prev.m_c.x - end.x, 2 * prev.m_c.y - end.y};
                         prev.m_p = mid;
                         c.m_vertices.emplace_back(prev.m_type, end, prev.m_c);
+                        if (trackIds) {
+                            c.m_edgeIds.push_back(c.m_edgeIds.back());
+                        }
                     }
                 }
                 continue;
@@ -906,6 +971,10 @@ void CArea::SetFromResult(
             if (parentData.edgeTag == tagSentinel) {
                 parentData.edgeTag = tag;
             }
+            if (parentData.edgeId == idSentinel) {
+                parentData.edgeId = prevId;
+            }
+            prevId = parentData.edgeId;
             if (tag == tagSentinel) {
                 tag = parentData.edgeTag;
             }
@@ -915,6 +984,7 @@ void CArea::SetFromResult(
             if (parentData.edgeTag != tag) {
                 saveCurve();
                 c.m_vertices.clear();
+                c.m_edgeIds.clear();
             }
             tag = parentData.edgeTag;
 
@@ -942,8 +1012,10 @@ void CArea::SetFromResult(
                 }
             }
 
-            // Check if the edge is a continuation of an existing arc
-            if (edge.m_type != 0 && edge.m_type == prev.m_type && edge.m_c == prev.m_c) {
+            // Check if the edge is a continuation of an existing arc (with the same edge id)
+            const bool sameId = !trackIds || c.m_edgeIds.empty()
+                || c.m_edgeIds.back() == parentData.edgeId;
+            if (edge.m_type != 0 && edge.m_type == prev.m_type && edge.m_c == prev.m_c && sameId) {
                 // It is. If the edge does not complete a circle, we should extend the existing
                 // CVertex instead of adding a new one.
                 const bool fullLoop = std::prev(c.m_vertices.end(), 2)->m_p.exactlyEquals(edge.m_p);
@@ -957,11 +1029,17 @@ void CArea::SetFromResult(
                     const heeks::Point mid {2 * edge.m_c.x - edge.m_p.x, 2 * edge.m_c.y - edge.m_p.y};
                     prev.m_p = mid;
                     c.m_vertices.push_back(edge);
+                    if (trackIds) {
+                        c.m_edgeIds.push_back(parentData.edgeId);
+                    }
                 }
             }
             else {
                 // The edge is not an extension of the previous CVertex; just add it
                 c.m_vertices.push_back(edge);
+                if (trackIds) {
+                    c.m_edgeIds.push_back(parentData.edgeId);
+                }
             }
         }
 
@@ -978,12 +1056,17 @@ void CArea::SetFromResult(
             // the current curve, and if so deduplicate them
             CVertex& edge = firstCurve->m_vertices.front();
             CVertex& prev = c.m_vertices.back();
-            if (edge.m_type != 0 && edge.m_type == prev.m_type && edge.m_c == prev.m_c) {
+            const bool sameId = !trackIds || firstCurve->m_edgeIds.empty() || c.m_edgeIds.empty()
+                || firstCurve->m_edgeIds.front() == c.m_edgeIds.back();
+            if (edge.m_type != 0 && edge.m_type == prev.m_type && edge.m_c == prev.m_c && sameId) {
                 // It is an extension
                 const bool fullLoop = std::prev(c.m_vertices.end(), 2)->m_p.exactlyEquals(edge.m_p);
                 if (!fullLoop) {
                     prev.m_p = edge.m_p;
                     firstCurve->m_vertices.pop_front();
+                    if (trackIds) {
+                        firstCurve->m_edgeIds.pop_front();
+                    }
                 }
                 else {
                     // Full circle; represent it as 2 semi circles
@@ -995,6 +1078,10 @@ void CArea::SetFromResult(
             // Concatenate them
             firstCurve->m_vertices
                 .insert(firstCurve->m_vertices.begin(), c.m_vertices.begin(), c.m_vertices.end());
+            if (trackIds) {
+                firstCurve->m_edgeIds
+                    .insert(firstCurve->m_edgeIds.begin(), c.m_edgeIds.begin(), c.m_edgeIds.end());
+            }
         }
         else if (!firstTag && isClosed && c.m_vertices.size() >= 3) {
             // Similar to the above, but if the closed input curve has only one tag in it then no
@@ -1003,12 +1090,16 @@ void CArea::SetFromResult(
             // First check if the first CVertex of the curve can extend the last CVertex
             CVertex& first = *std::next(c.m_vertices.begin());
             CVertex& last = c.m_vertices.back();
-            if (last.m_type != 0 && last.m_type == first.m_type && last.m_c == first.m_c) {
+            const bool sameId = !trackIds || c.m_edgeIds.front() == c.m_edgeIds.back();
+            if (last.m_type != 0 && last.m_type == first.m_type && last.m_c == first.m_c && sameId) {
                 // It is an extension
                 const bool fullLoop = std::prev(c.m_vertices.end(), 2)->m_p.exactlyEquals(first.m_p);
                 if (!fullLoop) {
                     c.m_vertices.front().m_p = std::prev(c.m_vertices.end(), 2)->m_p;
                     c.m_vertices.pop_back();
+                    if (trackIds) {
+                        c.m_edgeIds.pop_back();
+                    }
                 }
                 else {
                     // Break it into 2 semi circles
@@ -1273,7 +1364,7 @@ SegmentData CArea::getParentMetadataFallback(
     std::cerr << "Warning: getParentMetadataFallback: no parent edge found for z=(" << p1.z << ","
               << p2.z << "), falling back to line\n";
     const PointD pt = ToPointD(p2);
-    return {{{pt.x, pt.y}}, tagSentinel, -1, -1};
+    return {{{pt.x, pt.y}}, tagSentinel, -1, -1, idSentinel};
 }
 
 // Return the parent of the provided edge, specified as (zMin, zMax) of its endpoints

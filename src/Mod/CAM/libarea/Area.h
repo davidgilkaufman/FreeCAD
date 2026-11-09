@@ -59,6 +59,7 @@ struct SegmentData
     int edgeTag;  // 1 = offset kept (positive side), -1 = offset discarded (negative side), 0 = end cap
     int curveIndex;
     int vertexIndex;
+    int edgeId = 0;  // user edge id from CCurve::m_edgeIds (0 if none)
 };
 
 
@@ -144,6 +145,9 @@ struct ConversionMetadata
 
     // Track the next curve index for MakePoly calls
     int nextCurveIndex;
+
+    // True if any input curve carried m_edgeIds; if so, output curves get m_edgeIds too
+    bool hasEdgeIds = false;
 
     ConversionMetadata()
         : z_next(1)

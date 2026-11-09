@@ -270,11 +270,14 @@ def approximateWire(wire, tolerance=0.01):
     return wire
 
 
-def wireToCArea(wire, tolerance=0.01):
+def wireToCArea(wire, tolerance=0.01, edgeIds=None):
     """wireToCArea(wire) ... converts a FreeCAD wire to a Clipper Area representation.
 
     Parameters:
         wire: Part.Wire to convert
+        edgeIds: optional list of integer ids, one per edge of wire.Edges. If given, the output
+            curve's edgeIds are set so every output edge carries the id of the input edge it came
+            from (edges needing approximation are approximated one at a time to preserve this).
 
     Returns:
         area.Area object containing a single curve representing the wire's geometry
@@ -284,11 +287,37 @@ def wireToCArea(wire, tolerance=0.01):
 
     # Approximate wire as lines and arcs
     coincideTolerance = getCoincideTolerance(wire.Edges)
-    if coincideTolerance is None or coincideTolerance > Path.Geom.Tolerance:
-        wire = discretizeWire(wire, tolerance)
+    discretize = coincideTolerance is None or coincideTolerance > Path.Geom.Tolerance
+    ids = None
+    if edgeIds is None:
+        if discretize:
+            wire = discretizeWire(wire, tolerance)
+        else:
+            wire = approximateWire(wire, tolerance)
+        edges = _orientEdges(Part.__sortEdges__(wire.Edges))
     else:
-        wire = approximateWire(wire, tolerance)
-    edges = _orientEdges(Part.__sortEdges__(wire.Edges))
+        # Approximate one edge at a time, so each output edge inherits its input edge's id.
+        # Order and orient the input edges first (OrderedEdges keeps the input TShapes, so ids
+        # can be looked up with isSame; _orientEdges only flips edges and preserves order).
+        assert len(edgeIds) == len(wire.Edges), "need one edge id per edge"
+        ordered = wire.OrderedEdges
+        orderedIds = [
+            next(i for e, i in zip(wire.Edges, edgeIds) if e.isSame(oe)) for oe in ordered
+        ]
+        subEdges = []
+        ids = []
+        for edge, edgeId in zip(_orientEdges(ordered), orderedIds):
+            if discretize:
+                approx = discretizeWire(Part.Wire([edge]), tolerance).Edges
+            else:
+                approx = approximateWire(Part.Wire([edge]), tolerance).Edges
+            # keep the pieces running in the same direction as the oriented edge
+            start = edge.valueAt(edge.FirstParameter)
+            if not any(Path.Geom.pointsCoincide(start, v.Point) for v in approx[0].Vertexes):
+                approx = list(reversed(approx))
+            subEdges.extend(approx)
+            ids.extend([edgeId] * len(approx))
+        edges = _orientEdges(subEdges)
 
     # Add the first point (start of first edge)
     if len(edges) > 0:
@@ -296,7 +325,9 @@ def wireToCArea(wire, tolerance=0.01):
         c.append(area.Vertex(area.Point(first_point.x, first_point.y)))
 
     # Process each edge, adding its endpoint
+    curveIds = []
     for i, edge in enumerate(edges):
+        nBefore = c.getNumVertices()
         curve = edge.Curve
         p0 = edge.firstVertex().Point
         p1 = edge.lastVertex().Point
@@ -334,17 +365,25 @@ def wireToCArea(wire, tolerance=0.01):
         else:
             raise TypeError(f"Unsupported curve type: {type(curve).__name__}")
 
+        if ids is not None:
+            curveIds.extend([ids[i]] * (c.getNumVertices() - nBefore))
+
+    if ids is not None:
+        c.edgeIds = curveIds
     a.append(c)
     return a
 
 
-def cAreaToWires(carea, z=0.0, tolerance=0.01):
+def cAreaToWires(carea, z=0.0, tolerance=0.01, edgeIds=None):
     """cAreaToWires(carea, z, tolerance) ... converts a Clipper Area to FreeCAD wires.
 
     Parameters:
         carea: area.Area object to convert
         z: Z-coordinate for the wires (default: 0.0)
         tolerance: Tolerance to set on vertices (default: 0.01)
+        edgeIds: optional output list. If given, for each returned wire a list of ids (one per
+            edge, in wire.Edges order) is appended, taken from the curves' edgeIds (0 if the curve
+            has none)
 
     Returns:
         list of Part.Wire objects
@@ -357,7 +396,9 @@ def cAreaToWires(carea, z=0.0, tolerance=0.01):
     # Process each curve in the area
     for curve in carea.getCurves():
         edges = []
+        wireIds = []
         vertices = curve.getVertices()
+        curveIds = list(curve.edgeIds) or [0] * (len(vertices) - 1)
 
         if len(vertices) < 2:
             continue
@@ -380,12 +421,18 @@ def cAreaToWires(carea, z=0.0, tolerance=0.01):
                 for vertex in edge.Vertexes:
                     vertex.Tolerance = line_tolerance
                 edges.append(edge)
+                wireIds.append(curveIds[i - 1])
             else:
                 # Arc: type == 1 for CCW, type == -1 for CW
                 center = FreeCAD.Vector(v1.c.x, v1.c.y, z)
                 if i + 1 < len(vertices):
                     v2 = vertices[i + 1]
-                    if v2.type == v1.type and v2.c.x == v1.c.x and v2.c.y == v1.c.y:
+                    if (
+                        v2.type == v1.type
+                        and v2.c.x == v1.c.x
+                        and v2.c.y == v1.c.y
+                        and curveIds[i - 1] == curveIds[i]
+                    ):
                         # merge arcs of the same circle and same direction
                         continue
 
@@ -411,12 +458,16 @@ def cAreaToWires(carea, z=0.0, tolerance=0.01):
                     vertex.Tolerance = tolerance
 
                 edges.append(edge)
+                wireIds.append(curveIds[i - 1])
 
             v0 = v1
 
         if edges:
             wire = Part.Wire(edges)
             wires.append(wire)
+            if edgeIds is not None:
+                assert len(wire.Edges) == len(wireIds)
+                edgeIds.append(wireIds)
 
     return wires
 

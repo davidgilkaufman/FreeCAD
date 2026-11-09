@@ -261,6 +261,7 @@ void CCurve::Reverse()
 
     m_vertices.swap(new_vertices);
     m_edgeTags.reverse();
+    m_edgeIds.reverse();
 }
 
 double CCurve::GetArea() const
@@ -299,7 +300,7 @@ bool CCurve::IsExactlyClosed() const
 
 void CCurve::ChangeStart(const Point& p)
 {
-    if (!m_edgeTags.empty()) {
+    if (!m_edgeTags.empty() || !m_edgeIds.empty()) {
         // This could be implemented but it isn't needed, so I'm not bothering
         throw std::logic_error(
             "ChangeStart called on a curve with edge tags, but it does not handle tags"
@@ -573,6 +574,7 @@ void CCurve::operator+=(const CCurve& curve)
         }
     }
     m_edgeTags.insert(m_edgeTags.end(), curve.m_edgeTags.begin(), curve.m_edgeTags.end());
+    m_edgeIds.insert(m_edgeIds.end(), curve.m_edgeIds.begin(), curve.m_edgeIds.end());
 }
 
 const Point Span::null_point = Point(0, 0);

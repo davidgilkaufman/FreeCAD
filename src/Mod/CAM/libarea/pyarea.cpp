@@ -271,6 +271,9 @@ void init_pyarea(py::module& m)
     py::class_<CCurve>(m, "Curve")
         .def(py::init<>())
         .def("getVertices", &getVertices)
+        // Per-edge integer ids (one per vertex after the first, or empty). Carried through
+        // Offset/OpenOffset/clipping onto the output edges derived from each input edge.
+        .def_readwrite("edgeIds", &CCurve::m_edgeIds)
         .def("append", &CCurve::append)
         .def("append", &append_point)
         .def("text", &print_curve)

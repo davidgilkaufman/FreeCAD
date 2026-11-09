@@ -25,6 +25,8 @@ import FreeCAD
 import Part
 import Path
 from Path.Base import Drillable
+import Path.Op.Util
+import area
 import Path.Op.Area as PathAreaOp
 import Path.Op.Base as PathOp
 from PathScripts import PathUtils
@@ -589,17 +591,25 @@ class ObjectProfile(PathAreaOp.ObjectOp):
                     edgeslist.extend(bEs)
 
         flattenEdges = []
+        flatToInput = []  # (flattened edge, input edge it came from)
         for edge in edgeslist:
             if flattened := self._flattenWire(obj, edge, obj.FinalDepth.Value):
                 _, flatWire = flattened
                 flattenEdges.extend(flatWire.Edges)
+                flatToInput.extend((fe, edge) for fe in flatWire.Edges)
 
         for se in Part.getSortedClusters(flattenEdges):
             wire = Part.Wire(se)
             if wire.isClosed():
                 shapeTups.extend(self._processClosedWire(obj, wire))
             else:
-                shapeTups.extend(self._processOpenWire(obj, wire))
+                # Recover the input edges (at their real depth) of this cluster
+                inputEdges = []
+                for fe in se:
+                    ie = next(ie for f, ie in flatToInput if f.isSame(fe))
+                    if not any(ie.isSame(e) for e in inputEdges):
+                        inputEdges.append(ie)
+                shapeTups.extend(self._processOpenWire(obj, inputEdges))
 
         return shapeTups
 
@@ -644,54 +654,151 @@ class ObjectProfile(PathAreaOp.ObjectOp):
 
         return shapeTups
 
-    def _processOpenWire(self, obj, wire):
-        """_processOpenWire(obj, wire) ... returns wire which is offset of the open wire"""
-        solids = Part.Compound(self.solids)
-        cutting_plane = Path.Geom.makeBoundBoxFace(
-            solids.BoundBox, 10, wire.BoundBox.ZMax + self.tol
-        )  # create boundbox face, with extra offset
-        section = solids.section(cutting_plane)
-        section.translate(FreeCAD.Vector(0, 0, -self.tol))
-
-        shapeTups = []
-        goodWires = []
-        passOffsets = self.areaOpAreaParams(obj, False)["Offset"]
-        index = obj.Side == "Inside"
-        for po in passOffsets:
-            owires = Path.Op.Util.offsetWire(wire, self.solids, po, tolerance=self.tol)[index]
-            owires = [Path.Op.Util.orientWire(w) for w in owires]
-
-            if not section.Edges:
-                goodWires.extend(owires)
-                continue
-
-            # process intersections tool with section of the model
-            temp = owires[:]
-            added = False
-            while temp:
-                owire = temp.pop()
-                distData = owire.distToShape(section)
-                dist = distData[0]
-                if Path.Geom.isGreaterEqual(dist, self.radius, 2 * self.tol):
-                    goodWires.append(owire)
-                    added = True
-                else:
-                    point = distData[1][0][1]  # nearest point on section which intersects with tool
-                    circle = Part.makeCircle(self.radius, point)
-                    face = Part.makeFace(circle)
-                    cut = owire.cut(face, self.tol)
-                    temp.extend(cut.Wires)
-
-            if not added:
-                # add offset wires as is, if offset wires was completelly cutted by solids
-                goodWires.extend(owires)
-
-        if goodWires:
-            shapeTups.append((Part.Compound(goodWires), False, "OpenEdge"))
-        else:
+    def _processOpenWire(self, obj, inputEdges):
+        """_processOpenWire(obj, inputEdges) ... returns the offset of the open wire formed by
+        inputEdges (the selected edges at their real depth)."""
+        openWires = self._exploreClosedOffsetOfOpenWire(obj, inputEdges)
+        if not openWires:
             Path.Log.error(self.inaccessibleMsg)
+            return []
+        openWires = [Path.Op.Util.orientWire(w) for w in openWires]
+        return [(Part.Compound(openWires), False, "OpenEdge")]
 
-        return shapeTups
+    def _exploreClosedOffsetOfOpenWire(self, obj, inputEdges):
+        """EXPLORATION: compute the open wire offset by offsetting the closed model sections that
+        contain the open edges, then keeping only the offset edges derived from the open edges.
+        inputEdges are the selected edges at their real depth. Intermediate results are shown with
+        Part.show(). Returns the filtered offset wires of all passes."""
+        # All vertices/edges of the open wire must be at a single z
+        # TODO: instead of asserting, group the open wire's edges by z-level and process each level
+        # separately. Unsure what to do with edges that change z (not horizontal).
+        z = inputEdges[0].Vertexes[0].Point.z
+        zs = [b for e in inputEdges for b in (e.BoundBox.ZMin, e.BoundBox.ZMax)]
+        assert all(
+            Path.Geom.isRoughly(zz, z, self.tol) for zz in zs
+        ), f"open wire is not at a single z: {min(zs)}..{max(zs)}"
+
+        # Sections of the model just above ("Up") and just below ("Down") the plane at z. Input
+        # edges are matched to the up section first; only edges not found there are matched to the
+        # down section (which is skipped entirely if every edge was found in the up section).
+        # Compute and show both sections, for inspection
+        sections = []
+        for label, direction in (("Up", -1), ("Down", 1)):
+            sliceWires = self._sliceSide(self.solids, z, direction)
+            Part.show(Part.Compound(sliceWires), f"OpenWire_{label}Slice")
+            sections.append((label, sliceWires))
+
+        result = []
+        unmatched = set(range(len(inputEdges)))
+        for label, sliceWires in sections:
+            if not unmatched:
+                break
+            result.extend(
+                self._offsetSectionKeepingEdges(obj, label, sliceWires, inputEdges, unmatched, z)
+            )
+        for idx in sorted(unmatched):
+            Path.Log.warning("explore: input edge {} not found in either section".format(idx))
+        return result
+
+    def _offsetSectionKeepingEdges(self, obj, label, sliceWires, inputEdges, unmatched, z):
+        """EXPLORATION: match the input edges with indices in `unmatched` onto the edges of the
+        closed section sliceWires, offset the section (positive side only), and return the parts of
+        the offset derived from matched input edges, as wires. Indices that get matched are removed
+        from `unmatched`."""
+        if not sliceWires:
+            return []
+
+        # Match each slice edge to an input edge: id = index + 1, or sentinel 0 if no match. A
+        # slice edge matches if cutting it by the input edge leaves nothing, i.e. it lies on the
+        # input edge within OCC tolerances (independent of either edge's orientation).
+        candidates = sorted(unmatched)
+
+        def matchEdge(se):
+            for idx in candidates:
+                ie = inputEdges[idx]
+                if se.BoundBox.intersect(ie.BoundBox) and not se.cut(ie).Edges:
+                    return idx + 1
+            return 0
+
+        sliceIds = [[matchEdge(e) for e in w.Edges] for w in sliceWires]
+        matched = {i - 1 for ids in sliceIds for i in ids if i}
+        if not matched:
+            return []
+        unmatched -= matched
+        Part.show(
+            Part.Compound(
+                [e for w, ids in zip(sliceWires, sliceIds) for e, i in zip(w.Edges, ids) if i]
+            ),
+            f"OpenWire_{label}SliceMatched",
+        )
+
+        passOffsets = self.areaOpAreaParams(obj, False)["Offset"]
+        result = []
+        original_accuracy = area.get_accuracy()
+        try:
+            area.set_accuracy(min(original_accuracy, self.tol))
+            for po in passOffsets:
+                carea = area.Area()
+                for w, ids in zip(sliceWires, sliceIds):
+                    for c in Path.Op.Util.wireToCArea(w, self.tol, ids).getCurves():
+                        carea.append(c)
+                # Only the positive (away from material) side: the model section determines which
+                # side of the open edges the tool goes on, so obj.Side's sign is not used here
+                carea.Offset(abs(po))
+                outIds = []
+                outWires = Path.Op.Util.cAreaToWires(carea, z, self.tol, outIds)
+                Part.show(Part.Compound(outWires), f"OpenWire_{label}ClosedOffset")
+
+                # Keep only edges derived from the open edges, and join connected runs (wrapping
+                # around closed wires) into wires
+                openWires = []
+                for w, ids in zip(outWires, outIds):
+                    runs = [[]]
+                    for e, i in zip(w.Edges, ids):
+                        if i:
+                            runs[-1].append(e)
+                        elif runs[-1]:
+                            runs.append([])
+                    runs = [r for r in runs if r]
+                    if w.isClosed() and len(runs) > 1 and ids[0] and ids[-1]:
+                        runs[0] = runs.pop() + runs[0]
+                    openWires.extend(Part.Wire(r) for r in runs)
+                result.extend(openWires)
+                if openWires:
+                    Part.show(Part.Compound(openWires), f"OpenWire_{label}FilteredOffset")
+                else:
+                    Path.Log.warning("explore: no tagged edges in {} offset {}".format(label, po))
+        finally:
+            area.set_accuracy(original_accuracy)
+        return result
+
+    @staticmethod
+    def _sliceSide(solids, z, direction):
+        """VERY EXPERIMENTAL -- _sliceSide(solids, z, direction) ... returns the wires of the section
+        of solids by the horizontal plane at z, for the material just above the plane
+        (direction = -1) or just below it (direction = +1).
+
+        Shape.slice(dir, d) (TopoCrossSection::sliceSolid) removes the half-space on the +dir side
+        of the plane and returns the wires of the remaining material's faces lying in the plane. So
+        dir = +Z gives the section of the material below the plane, and dir = -Z (with d = -z, since
+        the plane is dir . p = d) the section of the material above it. When the plane is exactly at
+        a horizontal model face these differ: e.g. for a boss standing on a floor at z, only the
+        "above" section contains the boss outline; for the rim of a pocket at z, only the "below"
+        section contains the pocket outline.
+        """
+        wires = Part.Compound(solids).slice(FreeCAD.Vector(0, 0, direction), direction * z)
+        if not wires:
+            return []
+
+        # sliceSolid returns the wires of each in-plane face of the remaining material separately,
+        # and the boolean leaves adjacent coplanar faces unmerged (e.g. a pre-existing horizontal
+        # face next to the face created by the cut). Their shared boundary then appears twice, once
+        # in each face's wire. Rebuild faces from the wires (Bullseye nests holes inside their outer
+        # loops), fuse them, and refine (UnifySameDomain) to merge the coplanar faces and drop the
+        # duplicated seam edges.
+        faces = Part.makeFace(wires, "Part::FaceMakerBullseye").Faces
+        merged = faces[0].fuse(faces[1:]).removeSplitter() if len(faces) > 1 else faces[0]
+        return [w for f in merged.Faces for w in f.Wires]
 
     def _flattenWire(self, obj, wire, trgtDep):
         """_flattenWire(obj, wire)... Returns a flattened version of the wire"""

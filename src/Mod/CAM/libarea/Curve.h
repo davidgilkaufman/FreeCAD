@@ -114,6 +114,12 @@ public:
     // Per-edge tags set by NaiveOffset: 1 = positive offset, -1 = negative offset, 0 = end cap.
     // Either empty (no tags) or one entry per edge (i.e. per vertex after the first).
     std::list<int> m_edgeTags;
+
+    // Optional per-edge user ids. Either empty (no ids) or one entry per edge (i.e. per vertex
+    // after the first). These are carried through Offset/OpenOffset/clipping: each output edge
+    // is given the id of the input edge it was derived from (0 for curves without ids). Output
+    // curves only carry ids if at least one input curve had ids.
+    std::list<int> m_edgeIds;
     void append(const CVertex& vertex);
 
     void Discretize();
